@@ -1,0 +1,847 @@
+<!DOCTYPE html>
+<!--
+ * Copyright © Acision 2015. All rights reserved.
+-->
+
+<html>
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge"/>
+
+<title>forgeAS drone demo</title>
+
+<link rel="stylesheet" href="/css/smoothness/jquery-ui-1.10.4.custom.css" />
+<link rel="shortcut icon" href="img/icon.ico" />
+<script src="/js/jquery-1.11.0.js"></script>
+<script src="/js/jquery-ui-1.10.4.custom.js"></script>
+<script src="/js/underscore.js"></script>
+<script src="/js/sdk.js"></script>
+
+<script>
+/** The drone to control. */
+var sDroneId;
+const defaultDroneStatus = {
+  "battery-level" : "100",
+  "error" : false
+};
+var droneStatus = defaultDroneStatus;
+
+/** Reference to the Acision SDK. */
+var acisionSDK = null;
+/** Reference to the current media session. */
+var mediaSession = null;
+/** Flag to avoid showing an error on an intentional disconnect. */
+var fNormalDisconnect = false;
+
+var authCode = '';
+const API_KEY = "<API KEY>";
+
+function dlgLogin_Login() {
+  console.log("dlgLogin_Login()");
+  var config = {
+    persistent: true
+  };
+
+  config.password = authCode || null;
+  authCode = '';
+
+  enableDialog("#dlgLogin", false);
+  showSpinner("#dlgLogin", true);
+
+  // Log in to the Acision SDK
+  acisionSDK = new AcisionSDK(API_KEY, {
+    onConnected: acisionSDK_onConnected,
+    onDisconnected: acisionSDK_onDisconnected,
+    onAuthFailure: acisionSDK_onAuthFailure
+  }, config);
+}
+
+function acisionSDK_onConnected() {
+  console.log("acisionSDK_onConnected()");
+
+  // We have successfully connected, so update the UI
+  showSpinner("#dlgLogin", false);
+  enableDialog("#dlgLogin", true);
+  $("#dlgLogin").dialog("close");
+  $("#dlgSelectDrone").dialog("option", "title", "Select drone").dialog("open");
+}
+
+function acisionSDK_onAuthFailure(evt) {
+  console.log("acisionSDK_onAuthFailure()");
+
+  // Currently the SDK will fire an onDisconnected event, so set our flag so
+  // that we don't display another error dialog
+  fNormalDisconnect = true;
+
+  if(evt && evt.interactiveUrl) {
+    return acisionSDK_oauthLogin(evt.interactiveUrl);
+  }
+
+  // The connection failed. Show an error message and reset the UI
+  showSpinner("#dlgLogin", false);
+  enableDialog("#dlgLogin", true);
+  showError("Login failed.", false);
+
+  acisionSDK = null;
+}
+
+// Convert url param string into JSON
+function processUrlParams(url) {
+  if (!url) {
+    return {};
+  }
+  var params = url.split('?')[1].split('&');
+  var urlParams = {};
+
+  for(var i = 0 ; i < params.length ; i++) {
+    var param = params[i].split('=');
+
+    urlParams[param[0]] = param[1];
+  }
+
+  return urlParams;
+}
+
+function acisionSDK_oauthLogin(url) {
+  window.location = url; // + "&state=" + parseInt(Math.random()*10000000) +"&prompt=login&resource=https://outlook.office365.com/";
+  return;
+}
+
+function acisionSDK_onDisconnected() {
+  console.log("acisionSDK_onDisconnected()");
+
+  // Once disconnected I don't want any more drone status updates
+  acisionSDK.presence.unsubscribe([sDroneId+"@sdk.acision.com"]);
+  droneStatus = defaultDroneStatus;
+
+  if (fNormalDisconnect) {
+    // We initiated the disconnect, so don't do anything
+    fNormalDisconnect = false;
+    return;
+  }
+
+  showError("Connection lost", true);
+}
+
+
+// Functions for making an outgoing video call
+function dlgSelectDrone_Start() {
+  console.log("dlgSelectDrone_Start()");
+
+  sDroneId = $("#droneId").val();
+  if (_.isEmpty(sDroneId)) {
+    return;
+  }
+
+  sDroneId = sDroneId.toLowerCase();
+
+  $(".divControl")
+    .off("click")
+    .on("click", divControl_click);
+
+  enableDialog("#dlgSelectDrone", false);
+  showSpinner("#dlgSelectDrone", true);
+
+  mediaSession = acisionSDK.webrtc.connect(sDroneId, {
+    onConnect: mediaSession_onConnect,
+    onConnecting: mediaSession_onConnecting,
+    onClose: mediaSession_onEarlyClose
+  }, {
+    streamConfig: {
+      audioIn: false,
+      audioOut: false,
+      videoIn: true,
+      videoOut: false
+    }
+  });
+  mediaSession.remoteVideoElement = document.getElementById("vidRemote");
+}
+
+function mediaSession_onConnect() {
+  console.log("mediaSession_onConnect()");
+  
+  mediaSession.setCallbacks({
+    onClose: mediaSession_onClose
+  });
+
+  showSpinner("#dlgDroneControl", false);
+
+  // Once connected subscribe to the drone status using presence
+  acisionSDK.presence.setCallbacks({
+    onPresentity : function(presentities) {
+      presentities.forEach(function (presentity) {
+        updatePosture(presentity.fields.posture);
+        updateBattery(presentity.fields["battery-level"], presentity.fields["battery-status"]);
+        updateErrorState(presentity.fields.posture, presentity.fields["jump-load"], presentity.fields["jump-motor"]);
+
+        _.extend(droneStatus, presentity.fields);
+      });
+    }
+  });
+  acisionSDK.presence.subscribe([sDroneId+"@sdk.acision.com"]);
+}
+
+function updatePosture(posture) {
+  if (posture) {
+    $("#standing").removeClass("currentPosture")
+    $("#jumper").removeClass("currentPosture")
+    $("#kicker").removeClass("currentPosture")
+    switch(posture) {
+    case 'standing':
+      $("#standing").addClass("currentPosture")
+      break;
+    case 'jumper':
+       $("#jumper").addClass("currentPosture")
+      break;
+    case 'kicker':
+       $("#kicker").addClass("currentPosture")
+      break;
+    }
+  }
+}
+
+function updateBattery(level, status) {
+  var doBatteryUpdate = function (batteryStatus) {
+    $("#divBattery").removeClass("battery75 battery50 battery25 batteryLow batteryCritical");
+    $("#divBattery").addClass(batteryStatus);
+  };
+
+  if (status) {
+    switch(status) {
+    case 'low':
+      doBatteryUpdate("batteryLow");
+      return;
+    case 'critical':
+      doBatteryUpdate("batteryCritical");
+      return;
+    }
+  }
+
+  if (level > 50 && droneStatus["battery-level"] > 75) {
+    doBatteryUpdate("battery75");
+  } else if (level > 25 && droneStatus["battery-level"] > 50) {
+   doBatteryUpdate("battery50");
+  } else if (level && droneStatus["battery-level"] > 25) {
+    doBatteryUpdate("battery25");
+  }
+}
+
+function updateErrorState(posture, jumpLoad, jumpMotor) {
+  var error = false;
+ 
+  if (posture == "stuck"
+      || jumpLoad == "busy"
+      || jumpMotor == "error-blocked" || jumpMotor == "error-overheated") {
+    error = true;
+  }
+ 
+  if (error != droneStatus.error) {
+    if (error) {
+      $("#divError").addClass("error");
+      $("#audError")[0].play();
+    } else {
+      $("#divError").removeClass("error");
+    }
+    droneStatus.error = error;
+  }
+}
+
+function mediaSession_onConnecting() {
+  console.log("mediaSession_onConnecting()");
+
+  showSpinner("#dlgSelectDrone", false);
+  enableDialog("#dlgSelectDrone", true);
+  // Disable close handler before closing as we're going forwards
+  $("#dlgSelectDrone").off("dialogbeforeclose").dialog("close");
+  showSpinner("#dlgDroneControl", true);
+  $("#dlgDroneControl").dialog("option", "title", sDroneId).dialog("open");
+}
+
+function dlgSelectDrone_beforeClose() {
+  console.log("dlgSelectDrone_beforeClose()");
+
+  // This event should only be enabled when cancelling the dialog
+
+  // This is an intentional disconnect so set our flag so that we don't then
+  // display an error dialog
+  fNormalDisconnect = true;
+
+  // Disconnect from the SDK and return to the login dialog
+  acisionSDK.disconnect();
+  acisionSDK = null;
+  $("#droneId").val("");
+  $("#dlgLogin").dialog("open");
+}
+
+function mediaSession_onEarlyClose(event) {
+  console.log("mediaSession_onEarlyClose(" + event + ")");
+
+  mediaSession = null;
+  $("#dlgDroneControl").dialog("close");
+  $("#dlgSelectDrone").dialog("open");
+  showError("Connection refused: drone sent status \"" + event.status + "\"");
+}
+
+function mediaSession_onClose(event) {
+  console.log("mediaSession_onClose(" + event + ")");
+
+  mediaSession = null;
+  vidRemote.src = "";
+  if (!$("#dlgResult").dialog("isOpen")) {
+    $("#dlgDroneControl").dialog("close");
+    $("#dlgSelectDrone").dialog("open");
+  }
+}
+
+function dlgDroneControl_Disconnect(event, ui) {
+  console.log("dlgDroneControl_Disconnect(" + event + ", " + ui + ")");
+  $("#dlgDroneControl").dialog("close");
+}
+
+function dlgDroneControl_beforeClose(event, ui) {
+  console.log("dlgDroneControl_beforeClose(" + event + ")");
+
+  if (!_.isNull(mediaSession)) {
+    mediaSession.close("normal");
+    mediaSession = null;
+  }
+  $("#dlgSelectDrone").dialog("open");
+}
+
+function divControl_click(event) {
+  switch(event.target.id) {
+  case "turnLeft":
+    move = { "motion" : "left" };
+    break;
+  case "forward":
+    move = { "motion" : "forward" };
+    break;
+  case "turnRight":
+    move = { "motion" : "right" };
+    break;
+  case "longJump":
+    move = { "jump" : "long" };
+    break;
+  case "backward":
+    move = { "motion" : "backward" };
+    break;
+  case "highJump":
+    move = { "jump" : "high" };
+    break;
+  case "standing":
+    move = { "posture" : "standing" };
+    break;
+  case "jumper":
+    move = { "posture" : "jumper" };
+    break;
+  case "kicker":
+    move = { "posture" : "kicker" };
+    break;
+  default:
+    return;
+  }
+
+  acisionSDK.messaging.sendToDestination(sDroneId, JSON.stringify(move), {
+    "contentType" : "application/json"
+  });
+}
+
+/**
+ * Disconnect from the SDK and reset the page back to the login dialog.
+ */
+function reset() {
+  console.log("reset())");
+
+  if (!_.isNull(acisionSDK)) {
+    try {
+      // This is an intentional disconnect so set our flag so that we
+      // don't then display an error dialog
+      fNormalDisconnect = true;
+
+      acisionSDK.disconnect();
+      acisionSDK = null;
+    } catch (err) {
+      console.warn("Error when disconnecting SDK: ", err)
+    }
+  }
+
+  // Disable close handler before closing the Select User dialog
+  $("#dlgSelectDrone").off("dialogbeforeclose");
+
+  // Close all dialogs, then open login dialog
+  $(".ui-dialog-content").dialog("close");
+  $("#dlgLogin").dialog("open");
+}
+
+
+//Utility functions for managing the user interface
+
+function dlgLogin_open() {
+  $(window).off('beforeunload');
+}
+
+function dlgLogin_close() {
+  $(window).on('beforeunload', window_onbeforeunload);
+}
+
+function dlgOauth_open() {
+  console.log("dlgOauth_open()");
+}
+
+function dlgOauth_close() {
+
+}
+
+function window_onbeforeunload(event) {
+  return 'You are currently logged in. Leaving this page will log you out.';
+}
+
+function window_onunload(event) {
+  reset();
+}
+
+function dlgSelectDrone_open() {
+  console.log("dlgSelectDrone_open()");
+
+  // Enable the close handler so that cancelling the dialog sends us back to
+  // the login dialog
+  $("#dlgSelectDrone").on("dialogbeforeclose", dlgSelectDrone_beforeClose);
+}
+
+function dlgError_OK(event, ui) {
+  console.log("dlgError_OK(" + event + ")");
+
+  if ($(this).data("fatal")) {
+    reset();
+  } else {
+    $(this).dialog("close");
+  }
+}
+
+/**
+ * Handle the enter key in a text box by running the provided submitFunction.
+ *
+ * @param submitFunction
+ *       the event handler to run when the Enter key is pressed
+ * @return a keypress event handler
+ */
+function handleEnter(submitFunction) {
+  return function(event) {
+    if (event.keyCode == 13) {
+      submitFunction();
+      event.preventDefault();
+    }
+  }
+}
+
+/**
+ * Enable/disable a dialog by setting the disabled attribute on the dialog
+ * buttons.
+ *
+ * @param dialog
+ *       the JQuery selector of the dialog to modify
+ * @param enable
+ *       true to enable the dialog or false to disable it
+ */
+function enableDialog(dialog, enable) {
+  button = $(dialog).dialog("widget").find("button");
+  if (enable) {
+    button.removeAttr("disabled").removeClass("ui-state-disabled");
+  } else {
+    button.attr("disabled", "disabled").addClass("ui-state-disabled");
+  }
+}
+
+/**
+ * Show/hide a busy spinner in the button pane of a dialog.
+ *
+ * @param dialog
+ *       the JQuery selector of the dialog to modify
+ * @param show
+ *       true to show the spinner or false to hide it
+ */
+function showSpinner(dialog, show) {
+  if (show) {
+    $(dialog).dialog("widget").find(".ui-dialog-buttonset").prepend(
+        $("#imgSpinner").removeClass("ui-helper-hidden"));
+  } else {
+    $("body").append($("#imgSpinner").addClass("ui-helper-hidden"));
+  }
+}
+
+/**
+ * Display an error message.
+ *
+ * @param {string} message
+ *       The message to display
+ * @param {boolean} fatal
+ *       Whether or not this is a fatal error. If true, then reset() will be
+ *       called when the error message is closed.
+ */
+function showError(message, fatal) {
+  $("#spnErrorMessage").text(message);
+  $("#dlgError").data("fatal", fatal);
+  $("#dlgError").dialog("open");
+}
+
+//Initialise the user interface
+$().ready(function setup() {
+  $.widget("ui.dialog", $.ui.dialog, {
+    _title: function (title) {
+      // Override title function to insert the Acision logo (this is
+      // is needed as the default function escapes HTML)
+      title.html("<img src='img/icon.png' width='16' height='16' style='margin-right: 0.5em; vertical-align: bottom;'>"
+              + this.options.title);
+    }
+  });
+
+  $("#dlgLogin").dialog({
+    dialogClass: "no-close",
+    autoOpen: false,
+    closeOnEscape: false,
+    hide: true,
+    show: true,
+    title: "forgeAS drone demo",
+    buttons: [
+      {text: "Login with Facebook", click: dlgLogin_Login}
+    ],
+    open: dlgLogin_open,
+    close: dlgLogin_close
+  });
+
+  $("#dlgOauth").dialog({
+    dialogClass: "no-close",
+    autoOpen: false,
+    closeOnEscape: false,
+    hide: true,
+    show: true,
+    title: "Login with Office 365",
+    open: dlgOauth_open,
+    close: dlgOauth_close
+  });
+
+  $("#dlgSelectDrone").dialog({
+    autoOpen: false,
+    closeOnEscape: false,
+    hide: true,
+    show: true,
+    buttons: [
+      {text: "Logout", click: function() {$(this).dialog("close")}},
+      {text: "Control Drone", click: dlgSelectDrone_Start}
+    ],
+    open: dlgSelectDrone_open
+  });
+
+  $("#dlgDroneControl").dialog({
+    autoOpen: false,
+    closeOnEscape: false,
+    hide: true,
+    show: true,
+    width: 700,
+    beforeClose: dlgDroneControl_beforeClose,
+    buttons: [
+      {text: "Disconnect", click: dlgDroneControl_Disconnect}
+    ]
+  });
+
+  $("#dlgError").dialog({
+    title: "Error",
+    autoOpen: false,
+    hide: true,
+    show: true,
+    modal: true,
+    buttons: [
+      {text: "OK", click: dlgError_OK}
+    ]
+  });
+
+  $("#droneId").keypress(handleEnter(dlgSelectDrone_Start));
+
+  $(window).on("unload", window_onunload);
+
+  $("#dlgLogin").dialog("open");
+  
+  // Test for WebRTC support
+  if (!window.webkitRTCPeerConnection &&
+      !window.mozRTCPeerConnection &&
+      !window.RTCPeerConnection) {
+    showError("Warning: could not detect WebRTC support. " +
+      "This application may not function correctly.", false);
+  }
+});
+
+var params = processUrlParams(window.location.search);
+if (params.code) {
+  authCode = params.code;
+  // Hide auth code in url bar
+  if (history.replaceState) {
+    history.replaceState('', document.title, location.href.split('?')[0]);
+  }
+  setTimeout(function() {
+    dlgLogin_Login();
+  }, 100);
+}
+
+
+</script>
+
+<style>
+#divBackground {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  background: url(img/background.jpg) no-repeat center center fixed;
+  background-size: cover;
+  opacity: 0.85;
+}
+
+body {
+  font-size: 70%;
+}
+
+.ui-dialog-buttonset {
+  text-align: right;
+}
+
+.no-close {
+  display: none;
+}
+
+#dlgOauth {
+  padding: 0;
+  min-height: 210px !important;
+  min-width: 280px !important;
+}
+
+#imgSpinner {
+  vertical-align: middle;
+  margin-right: 1em;
+}
+
+#dlgDroneControl {
+  text-align: center;
+}
+
+.divControlContainer {
+  text-align: center;
+  display: inline-block;
+  width: 700px;
+}
+
+.divVideoContainer {
+  width: 640px;
+  height: 480px;
+  display: inline-block;
+  position: relative;
+  background: #000000;
+}
+
+#divBattery {
+  position: absolute;
+  top: 10px;
+  right: 5px;
+  width: 50px;
+  height: 50px;
+  background-image: url(img/battery_100.png);
+  background-position: center;
+  background-repeat: no-repeat;
+  opacity: 0.75;
+}
+
+#divBattery.battery75 {
+  background-image: url(img/battery_75.png);
+}
+
+#divBattery.battery50 {
+  background-image: url(img/battery_50.png);
+}
+
+#divBattery.battery25 {
+  background-image: url(img/battery_25.png);
+}
+
+#divBattery.batteryLow {
+  background-image: url(img/battery_low.png);
+}
+
+#divBattery.batteryCritical {
+  background-image: url(img/battery_critical.png);
+}
+
+#divError {
+  top: 0px;
+  left: 0px;
+  bottom: 0px;
+  right: 0px;
+  position: absolute;
+  background: #FF0000;
+  opacity: 0;
+  transition: opacity 1s;
+}
+
+#divError.error {
+  opacity: 0.6;
+}
+
+.divControlPanel {
+  width: 150px;
+  height: 150px;
+  display: inline-block;
+  position: relative;
+}
+
+.divControl {
+  position: absolute;
+  width: 50px;
+  height: 50px;
+  cursor: pointer;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+
+#turnLeft {
+  top: 0px;
+  left: 0px;  
+  background-image: url(img/L_def.png);
+}
+
+#turnLeft:active {
+  background-image: url(img/L_tap.png);
+}
+
+#forward {
+  top: 0px;
+  left: 50px;  
+  background-image: url(img/F_def.png);
+}
+
+#forward:active {
+  background-image: url(img/F_tap.png);
+}
+
+#turnRight {
+  top: 0px;
+  left: 100px;  
+  background-image: url(img/R_def.png);
+}
+
+#turnRight:active {
+  background-image: url(img/R_tap.png);
+}
+
+#longJump {
+  top: 50px;
+  left: 0px;  
+  background-image: url(img/LJ_def.png);
+}
+
+#longJump:active {
+  background-image: url(img/LJ_tap.png);
+}
+
+#backward {
+  top: 50px;
+  left: 50px;  
+  background-image: url(img/B_def.png);
+}
+
+#backward:active {
+  background-image: url(img/B_tap.png);
+}
+
+#highJump {
+  top: 50px;
+  left: 100px;  
+  background-image: url(img/HJ_def.png);
+}
+
+#highJump:active {
+  background-image: url(img/HJ_tap.png);
+}
+
+#standing {
+  top: 100px;
+  left: 0px;  
+  background-image: url(img/S_def.png);
+}
+
+#standing.currentPosture {
+  background-image: url(img/S_tap.png);
+}
+
+#jumper {
+  top: 100px;
+  left: 50px;  
+  background-image: url(img/J_def.png);
+}
+
+#jumper.currentPosture {
+  background-image: url(img/J_tap.png);
+}
+
+#kicker {
+  top: 100px;
+  left: 100px;  
+  background-image: url(img/K_def.png);
+}
+
+#kicker.currentPosture {
+  background-image: url(img/K_tap.png);
+}
+</style>
+</head>
+
+<body>
+  <div id="divBackground"></div>
+
+  <div id="dlgLogin" class="ui-widget">
+  </div>
+
+  <div id="dlgSelectDrone" class="ui-widget">
+    <p>
+      Drone ID<br /> <input type="text" id="droneId" />
+    </p>
+  </div>
+
+  <iframe id="dlgOauth" class="ui-widget"></iframe>
+
+  <div id="dlgDroneControl" class="ui-widget">
+    <div class="divControlContainer">
+      <div class="divVideoContainer">
+        <div id="divBattery"></div> 
+        <video id="vidRemote" width="640" height="480"
+          poster="img/poster.jpg" autoplay="autoplay"></video>
+        <div id="divError"></div>
+      </div>
+      <div class="divControlPanel">
+        <div id="turnLeft" class="divControl"></div>
+        <div id="forward" class="divControl"></div>
+        <div id="turnRight" class="divControl"></div>
+        <div id="longJump" class="divControl"></div>
+        <div id="backward" class="divControl"></div>
+        <div id="highJump" class="divControl"></div>
+        <div id="standing" class="divControl"></div>
+        <div id="jumper" class="divControl"></div>
+        <div id="kicker" class="divControl"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="dlgError" class="ui-widget ui-front">
+    <p id="pErrorMessage" class="ui-state-error ui-corner-all"
+      style="padding: 0.5em;">
+      <span class="ui-icon ui-icon-alert"
+        style="float: left; margin-right: 0.5ex;"></span>
+      <span id="spnErrorMessage"
+        style="display: block; overflow: hidden"></span>
+    </p>
+  </div>
+
+  <img id="imgSpinner" src="img/ajax-loader.gif" height="32" width="32"
+    class="ui-helper-hidden">
+
+  <audio id="audError" src="audio/error.wav"></audio>
+</body>
+</html>
