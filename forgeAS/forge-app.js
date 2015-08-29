@@ -307,7 +307,7 @@ function droneStop(time) {
 function configureDroneStatusUpdates(sdk) {
   sdk.presence.setOwnPresentity({
     "connected" : "no",
-    "batter-level" : "100",
+    "battery-level" : "100",
     "battery-status" : "ok",
     "posture" : "unknown",
     "jump-load" : "unknown",
